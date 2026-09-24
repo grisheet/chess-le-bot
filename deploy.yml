@@ -1,0 +1,113 @@
+name: Build and deploy chess app
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chess-github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # Supports the current repository where uploaded folders were flattened.
+      # This repairs only the build checkout; it never deletes files from GitHub.
+      - name: Restore source folders if needed
+        shell: python
+        run: |
+          from pathlib import Path
+          import shutil
+          root = Path('.')
+          if not (root / 'src/main.tsx').exists():
+              groups = {
+                  'src': ['App.tsx', 'main.tsx', 'styles.css', 'types.ts', 'vite-env.d.ts'],
+                  'src/components': ['AnalysisControls.tsx', 'Board.tsx', 'Modal.tsx', 'Results.tsx', 'SavedPositions.tsx', 'SetupControls.tsx'],
+                  'src/data': ['ratingProfiles.ts'],
+                  'src/lib': ['chess.ts', 'chess.test.ts', 'explainMove.ts', 'humanMoveSimulator.ts', 'quality.ts', 'storage.ts', 'validation.ts', 'webmcp.ts'],
+                  'src/services': ['stockfishEngine.ts', 'stockfishEngine.test.ts'],
+                  'scripts': ['copy-engine.mjs'],
+                  'public': ['favicon.svg'],
+              }
+              missing = [name for names in groups.values() for name in names if not (root / name).is_file()]
+              if missing:
+                  raise SystemExit('Required source files missing: ' + ', '.join(missing))
+              for folder, names in groups.items():
+                  destination = root / folder
+                  destination.mkdir(parents=True, exist_ok=True)
+                  for name in names:
+                      shutil.move(str(root / name), str(destination / name))
+              (root / 'index.html').write_text('''<!doctype html>
+          <html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><meta name="theme-color" content="#101311"/><link rel="icon" href="./favicon.svg"/><title>Chess Skill-Level Move Calculator</title></head><body><div id="root"></div><script type="module" src="/src/main.tsx"></script></body></html>''', encoding='utf-8')
+          if not (root / 'scripts/copy-engine.mjs').is_file():
+              raise SystemExit('Missing scripts/copy-engine.mjs; cannot install Stockfish assets.')
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install locked dependencies and engine
+        run: npm ci
+
+      - name: Test chess logic and engine service
+        run: npm test
+
+      - name: Build production site with relative asset paths
+        run: npm run build -- --base=./
+
+      - name: Verify deployable files
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+          dist = Path('dist')
+          html = (dist / 'index.html').read_text()
+          if '/src/main.tsx' in html:
+              raise SystemExit('Refusing to publish development HTML.')
+          for ref in re.findall(r'(?:src|href)="([^"]+)"', html):
+              if ref.startswith(('https://', 'http://', 'data:', '#')):
+                  continue
+              if ref.startswith('/'):
+                  raise SystemExit('Absolute asset path is unsafe for project Pages: ' + ref)
+              if not (dist / ref.split('?', 1)[0]).is_file():
+                  raise SystemExit('Missing production asset: ' + ref)
+          for suffix in ('js', 'wasm'):
+              asset = dist / 'engine' / ('stockfish-17.1-lite-single.' + suffix)
+              if not asset.is_file() or asset.stat().st_size < 1000:
+                  raise SystemExit('Stockfish asset missing or incomplete: ' + str(asset))
+          if (dist / 'engine/stockfish-17.1-lite-single.wasm').read_bytes()[:4] != b'\x00asm':
+              raise SystemExit('Engine asset is not WebAssembly.')
+          (dist / '.nojekyll').touch()
+          print('Verified production HTML, relative asset paths, and Stockfish JS/WASM.')
+
+      - name: Upload only the built site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Publish verified build
+        id: deployment
+        uses: actions/deploy-pages@v4
